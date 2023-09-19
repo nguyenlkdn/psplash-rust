@@ -1,64 +1,99 @@
-extern crate libdrm;
-use libdrm::buffer::{Buffer, BufferFlags};
-use libdrm::device::Device;
-use libdrm::framebuffer::Framebuffer;
-use libdrm::mode::{ModeInfo, ModeInfoFlags};
-use libdrm::result::DrmResult;
-use libdrm::encoder::Encoder;
-use libdrm::connector::Connector;
-use libdrm::crtc::Crtc;
-use libdrm::plane::Plane;
-use libdrm::version::Version;
+use drm::control::{ResourceHandle, crtc, framebuffer, Mode};
+use drm::Device as DrmDevice;
+use drm::buffer::Buffer as DrmBuffer;
+use gif::Frame;
 use std::fs::File;
-use std::io::Read;
-use std::os::unix::io::AsRawFd;
-
-fn load_gif_image(file_path: &str) -> Result<Vec<u8>, std::io::Error> {
-    let mut file = File::open(file_path)?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)?;
-    Ok(buffer)
-}
-
-fn init_drm_device() -> DrmResult<Device> {
-    let device = Device::new()?;
-    device.set_client_capability(libdrm::capability::DrmCapability::UniversalPlanes, true)?;
-    device.set_client_capability(libdrm::capability::DrmCapability::DumbBuffer, true)?;
-    Ok(device)
-}
-fn create_drm_buffer(device: &Device, image: &[u8]) -> DrmResult<Buffer> {
-    let buffer = Buffer::create_dumb(device, image.len() as u32, 1)?;
-    buffer.set_flags(BufferFlags::Write)?;
-    buffer.map(None)?;
-    buffer.write(image)?;
-    Ok(buffer)
-}
-fn setup_display_pipeline(device: &Device, buffer: &Buffer) -> DrmResult<()> {
-    let connector = device.get_connectors()?.get(0).ok_or("No connectors found")?;
-    let encoder = connector.get_encoders()?.get(0).ok_or("No encoders found")?;
-    let crtc = encoder.get_possible_crtcs()?.get(0).ok_or("No CRTCs found")?;
-    let mode = crtc.get_modes()?
-        .iter()
-        .find(|mode| mode.flags.contains(ModeInfoFlags::Preferred))
-        .ok_or("No preferred mode found")?;
-
-    let framebuffer = Framebuffer::create(device, &buffer, mode)?;
-    crtc.set_framebuffer(&framebuffer)?;
-    crtc.set_mode(mode)?;
-    crtc.set_encoder(encoder)?;
-
-    let plane = crtc.get_possible_planes()?.get(0).ok_or("No planes found")?;
-    plane.set_crtc(crtc)?;
-    plane.set_framebuffer(&framebuffer)?;
-
-    Ok(())
-}
+use std::io::BufReader;
+use std::path::Path;
+use std::thread;
+use std::time::Duration;
 
 fn main() {
-    let gif_image = load_gif_image("path/to/image.gif").expect("Failed to load GIF image");
-    let device = init_drm_device().expect("Failed to initialize DRM device");
-    let buffer = create_drm_buffer(&device, &gif_image).expect("Failed to create DRM buffer");
-    setup_display_pipeline(&device, &buffer).expect("Failed to set up display pipeline");
+    // Open the DRM device
+    let mut dev = drm::Card::open_global().unwrap();
 
-    // Your application logic here
+    // Get the first available DRM connector
+    let connector = dev.connectors().next().unwrap().unwrap();
+    
+    // Get the first available DRM encoder
+    let encoder = dev.encoders().next().unwrap().unwrap();
+    
+    // Get the first available DRM crtc
+    let crtc = dev.crtcs().next().unwrap().unwrap();
+    
+    // Get the modes of the connector
+    let modes = connector.modes().collect::<Vec<_>>();
+    
+    // Set the mode of the connector
+    dev.set_crtc(
+        crtc.handle(),
+        Some(encoder.handle()),
+        connector.handle(),
+        0,
+        0,
+        Some(&modes[0]),
+    )
+    .unwrap();
+
+    // Open the GIF file
+    let file = File::open("path/to/your/gif/file.gif").unwrap();
+    let mut decoder = gif::Decoder::new(BufReader::new(file));
+    let mut screen = vec![0; connector.mode().size() as usize];
+    
+    // Loop through the GIF frames
+    loop {
+        match decoder.read_info() {
+            Ok(frame) => {
+                let mut buffer = vec![0; frame.buffer_size()];
+                decoder.read_into_buffer(&mut buffer).unwrap();
+                
+                // Copy the frame buffer to the screen buffer
+                for (i, pixel) in buffer.iter().enumerate() {
+                    screen[i] = *pixel;
+                }
+                
+                // Create a DRM buffer from the screen buffer
+                let drm_buffer = DrmBuffer::new(
+                    &dev,
+                    screen.as_mut_slice(),
+                    connector.mode().size().0 as u32,
+                    connector.mode().size().1 as u32,
+                )
+                .unwrap();
+                
+                // Create a DRM framebuffer from the DRM buffer
+                let framebuffer = framebuffer::create(
+                    &dev,
+                    drm_buffer.handle(),
+                    connector.mode().size().0 as u32,
+                    connector.mode().size().1 as u32,
+                    32,
+                    0,
+                )
+                .unwrap();
+                
+                // Set the DRM framebuffer on the DRM crtc
+                crtc::set(
+                    &dev,
+                    crtc.handle(),
+                    Some(framebuffer.handle()),
+                    &[connector.handle()],
+                    connector.mode(),
+                )
+                .unwrap();
+                
+                // Sleep for the frame duration
+                thread::sleep(Duration::from_millis(frame.delay().into()));
+            }
+            Err(gif::DecodingError::IncompleteBuffer) => {
+                // Reached the end of the GIF
+                break;
+            }
+            Err(err) => {
+                // Error decoding the GIF
+                eprintln!("Error decoding GIF: {:?}", err);
+                break;
+            }
+        }
+    }
 }

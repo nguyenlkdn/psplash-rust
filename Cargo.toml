@@ -7,4 +7,4 @@ repository = "https://github.com/nguyenlkdn/psplash-rust.git"
 
 [dependencies]
 drm = "0.9.0"
-libdrm = "0.0.2"
+gif = "0.12.0"
